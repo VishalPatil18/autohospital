@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import AsyncIterator
+import uuid
+from collections.abc import AsyncIterator
 from uuid import UUID
 
 from sqlalchemy import select
@@ -9,123 +10,79 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai.llm import AnthropicClient
 from app.ai.retrieval import retrieve
 from app.db.models import ChatMessage
+from app.services.guardrails import sanitize_chunks, scope_header
+
+_llm = AnthropicClient()
 
 
-async def run_patient_chat(
-    session: AsyncSession,
+async def run_chat(
     user_id: UUID,
+    role: str,
     message: str,
-    conversation_id: UUID | None = None,
-) -> tuple[AsyncIterator[str], UUID, UUID]:
+    patient_ids: list[UUID],
+    conversation_id: UUID,
+    db: AsyncSession,
+) -> AsyncIterator[str]:
     """
-    Run a chat conversation for a patient.
+    Shared RAG chat pipeline used by both patient and doctor chat endpoints.
 
-    Retrieves relevant document chunks, streams Claude responses, and persists messages.
+    Steps:
+    1. Persist the user message.
+    2. Load prior conversation history.
+    3. Retrieve relevant chunks via pgvector similarity search.
+    4. Sanitize chunks to neutralize prompt injection.
+    5. Prepend scope-restriction header as first context chunk.
+    6. Stream tokens from Claude.
+    7. Persist the assembled assistant reply.
 
-    Args:
-        session: Database session
-        user_id: Patient's user ID
-        message: User's message
-        conversation_id: Existing conversation ID, or None for new
-
-    Returns:
-        (token_stream, conversation_id, message_id)
-        - token_stream: AsyncIterator of response tokens
-        - conversation_id: UUID of the conversation
-        - message_id: UUID of the user's message in the database
+    Yields:
+        Individual text tokens for SSE streaming.
     """
-    import uuid as uuid_module
-
-    # Use or generate conversation ID
-    if not conversation_id:
-        conversation_id = uuid_module.uuid4()
-
-    # Retrieve relevant document chunks for this patient
-    chunks_list = await retrieve(message, [user_id], k=8)
-    chunk_texts = [chunk.text for chunk in chunks_list]
-
-    # Load conversation history
-    history_result = await session.execute(
-        select(ChatMessage)
-        .where(ChatMessage.conversation_id == conversation_id)
-        .order_by(ChatMessage.created_at.asc())
-    )
-    history_messages = history_result.scalars().all()
-
-    # Build messages list for Claude
-    messages = []
-    for hm in history_messages:
-        messages.append(
-            {
-                "role": hm.role,
-                "content": hm.content,
-            }
-        )
-
-    # Add current user message
-    messages.append({"role": "user", "content": message})
-
-    # Persist user message
-    user_message_id = uuid_module.uuid4()
-    user_msg_obj = ChatMessage(
-        id=user_message_id,
+    # 1. Persist user message immediately (before streaming)
+    user_msg = ChatMessage(
+        id=uuid.uuid4(),
         user_id=user_id,
         conversation_id=conversation_id,
         role="user",
         content=message,
     )
-    session.add(user_msg_obj)
-    await session.flush()
+    db.add(user_msg)
+    await db.commit()
 
-    # Create assistant message for streaming
-    assistant_message_id = uuid_module.uuid4()
-    assistant_msg_obj = ChatMessage(
-        id=assistant_message_id,
+    # 2. Load conversation history (all messages in this conversation, ordered)
+    result = await db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.conversation_id == conversation_id)
+        .where(ChatMessage.id != user_msg.id)
+        .order_by(ChatMessage.created_at.asc())
+    )
+    history_rows = result.scalars().all()
+    history = [{"role": row.role, "content": row.content} for row in history_rows]
+    messages = history + [{"role": "user", "content": message}]
+
+    # 3. Retrieve relevant chunks (returns [] if no chunks ingested yet)
+    chunks = await retrieve(message, patient_ids)
+
+    # 4. Sanitize retrieved chunks
+    clean_texts = sanitize_chunks(chunks)
+
+    # 5. Prepend scope-restriction header so it lands in the LLM's context block
+    context_with_scope = [scope_header(role, patient_ids)] + clean_texts
+
+    # 6. Stream from Claude, collecting tokens for persistence
+    collected: list[str] = []
+    async for token in _llm.chat(messages, context_with_scope, scope=role):
+        collected.append(token)
+        yield token
+
+    # 7. Persist assembled assistant reply
+    assistant_text = "".join(collected)
+    assistant_msg = ChatMessage(
+        id=uuid.uuid4(),
         user_id=user_id,
         conversation_id=conversation_id,
         role="assistant",
-        content="",  # Will be filled as tokens stream in
+        content=assistant_text,
     )
-    session.add(assistant_msg_obj)
-    await session.flush()
-
-    # Stream tokens from Claude
-    client = AnthropicClient()
-    token_stream = client.chat(messages, chunk_texts, scope="patient")
-
-    return token_stream, conversation_id, user_message_id
-
-
-async def stream_and_persist_chat(
-    session: AsyncSession,
-    user_id: UUID,
-    token_stream: AsyncIterator[str],
-    assistant_message_id: UUID,
-) -> AsyncIterator[str]:
-    """
-    Consume token stream and persist the full response.
-
-    Args:
-        session: Database session
-        user_id: Patient's user ID (for re-loading the message)
-        token_stream: Token stream from Claude
-        assistant_message_id: UUID of the assistant message to update
-
-    Yields:
-        Tokens as they arrive
-    """
-    full_response = ""
-
-    async for token in token_stream:
-        full_response += token
-        yield token
-
-    # Update assistant message with full response
-    result = await session.execute(
-        select(ChatMessage).where(ChatMessage.id == assistant_message_id)
-    )
-    assistant_msg = result.scalars().first()
-    if assistant_msg:
-        assistant_msg.content = full_response
-        session.add(assistant_msg)
-        await session.commit()
+    db.add(assistant_msg)
+    await db.commit()

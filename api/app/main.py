@@ -13,6 +13,7 @@ from app.api.doctors import router as doctors_router
 from app.api.patients import router as patients_router
 from app.api.scribe import router as scribe_router
 from app.api.translate import router as translate_router
+from app.core.audit import AuditMiddleware
 from app.db.session import Base, engine
 
 
@@ -44,6 +45,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(AuditMiddleware)
 
 # All routers under /api prefix
 app.include_router(auth_router, prefix="/api")

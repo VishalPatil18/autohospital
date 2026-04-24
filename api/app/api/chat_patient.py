@@ -1,90 +1,65 @@
 from __future__ import annotations
 
 import json
+import uuid
+from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.auth import get_current_user
-from app.db.schemas import ChatRequest
+from app.core.auth import require_role
 from app.db.session import get_db
-from app.services import chat_service
+from app.services.chat_service import run_chat
 
 router = APIRouter(tags=["chat"])
 
 
+class PatientChatRequest(BaseModel):
+    message: str
+    conversation_id: UUID | None = None
+
+
 @router.post("/chat/patient")
 async def chat_patient(
-    request: ChatRequest,
-    current_user: dict = Depends(get_current_user),
-    session: AsyncSession = Depends(get_db),
-):
+    body: PatientChatRequest,
+    current_user: Any = Depends(require_role("patient")),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
     """
-    Patient chat endpoint with Server-Sent Events (SSE) streaming.
+    SSE endpoint for the patient chatbot.
 
-    Request body:
-    - message: str — The user's message
-    - conversation_id: str | None — Optional existing conversation ID
+    Retrieval is strictly scoped to the authenticated patient's own records.
 
-    Response: EventSource stream with tokens
-    - Each token is sent as JSON: {"token": "..."}
-    - On error, sends: {"error": "..."}
+    Streams tokens as:  data: {"token": "..."}\n\n
+    Terminates with:    data: {"done": true}\n\n
     """
-    try:
-        # Convert conversation_id string to UUID if provided
-        conversation_id = None
-        if request.conversation_id:
-            try:
-                conversation_id = UUID(request.conversation_id)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid conversation_id format")
+    patient_id: UUID = current_user.id
+    conversation_id = body.conversation_id or uuid.uuid4()
 
-        # Run chat and get token stream
-        token_stream, conv_id, msg_id = await chat_service.run_patient_chat(
-            session,
-            current_user["id"],
-            request.message,
-            conversation_id,
-        )
+    async def _event_stream():
+        try:
+            async for token in run_chat(
+                user_id=patient_id,
+                role="patient",
+                message=body.message,
+                patient_ids=[patient_id],
+                conversation_id=conversation_id,
+                db=db,
+            ):
+                yield f"data: {json.dumps({'token': token})}\n\n"
+        except Exception:
+            yield f"data: {json.dumps({'error': 'stream_error'})}\n\n"
+        finally:
+            yield f"data: {json.dumps({'done': True, 'conversation_id': str(conversation_id)})}\n\n"
 
-        # Stream tokens as SSE
-        async def event_generator():
-            try:
-                # Send conversation ID to client
-                yield f"data: {json.dumps({'type': 'conversation_id', 'value': str(conv_id)})}\n\n"
-
-                # Stream tokens
-                full_response = ""
-                async for token in token_stream:
-                    full_response += token
-                    yield f"data: {json.dumps({'type': 'token', 'value': token})}\n\n"
-
-                # Send completion
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
-
-            except Exception as err:
-                yield f"data: {json.dumps({'type': 'error', 'value': str(err)})}\n\n"
-            finally:
-                # Ensure final commit
-                await session.commit()
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
-    except HTTPException:
-        raise
-    except Exception as err:
-        await session.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Chat failed: {str(err)}",
-        )
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
